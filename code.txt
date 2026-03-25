@@ -1,0 +1,82 @@
+require("dotenv").config();
+const express = require("express");
+const mongoose = require("mongoose");
+const Stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+const { Queue } = require("bullmq");
+const Redis = require("ioredis");
+
+const app = express();
+const redis = new Redis(process.env.REDIS_URL);
+const videoQueue = new Queue("video", { connection: redis });
+
+// --- MODELS ---
+const User = mongoose.model("User", new mongoose.Schema({
+    email: { type: String, unique: true },
+    credits: { type: Number, default: 10 },
+    stripeCustomerId: String
+}));
+
+// --- 1. STRIPE CHECKOUT ROUTE ---
+// User jab "Buy" dabayega, ye session create karega
+app.post("/api/payments/create-session", async (req, res) => {
+    const { userId } = req.body; // Front-end se userId bhejein
+    
+    try {
+        const session = await Stripe.checkout.sessions.create({
+            payment_method_types: ['card'],
+            mode: 'payment',
+            customer_email: (await User.findById(userId)).email,
+            line_items: [{
+                price_data: {
+                    currency: 'inr', // India ke liye 'inr', bahar ke liye 'usd'
+                    product_data: { name: '50 VibeGen Credits', description: 'AI Video Generation Credits' },
+                    unit_amount: 50000, // ?500.00 (Paisa mein likhte hain)
+                },
+                quantity: 1,
+            }],
+            metadata: { userId: userId.toString() }, // Ye zaroori hai track karne ke liye
+            success_url: `${process.env.DOMAIN}/success?session_id={CHECKOUT_SESSION_ID}`,
+            cancel_url: `${process.env.DOMAIN}/cancel`,
+        });
+
+        res.json({ url: session.url }); // Frontend ko Stripe ka link bhej do
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- 2. STRIPE WEBHOOK (The "Automatic" Part) ---
+// Ye route Stripe khud call karega jab payment success hogi
+app.post("/api/payments/webhook", express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+
+    try {
+        event = Stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    // Agar payment success hui
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const userId = session.metadata.userId;
+
+        // User ke account mein credits add karo
+        await User.findByIdAndUpdate(userId, { $inc: { credits: 50 } });
+        console.log(`? Credits added to User: ${userId}`);
+    }
+
+    res.json({ received: true });
+});
+
+// --- FRONTEND UPDATE (Button Logic) ---
+/* Frontend mein bas ye function daalna hai:
+   async function pay() {
+      const res = await fetch('/api/payments/create-session', { method: 'POST', ... });
+      const data = await res.json();
+      window.location.href = data.url; // Stripe page par bhej dega
+   }
+*/
+
+app.listen(5000, () => console.log("?? VibeGen Payment Engine Live!"));
